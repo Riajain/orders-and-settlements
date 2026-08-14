@@ -2,7 +2,7 @@
 
 A small full-stack app for tracking orders, recording partial/full payments, and monitoring settlement status. Built as a take-home assignment.
 
-**Live URL:** _add after deploying (see [Deployment](#deployment))_
+**Live URL:** https://orders-and-settlements-psi.vercel.app
 
 **Demo login:** `demo@example.com` / `demo1234` — comes pre-seeded with 4 orders across all status types.
 
@@ -14,12 +14,12 @@ A small full-stack app for tracking orders, recording partial/full payments, and
 |---|---|
 | Framework | Next.js 16 App Router (RSC for reads, REST API for writes) |
 | Language | TypeScript (strict) |
-| Database | SQLite via Prisma 5.22 |
+| Database | Postgres via Prisma 5.22 (Neon serverless in prod) |
 | Auth | Auth.js v5 — Credentials provider + JWT sessions, `bcryptjs` password hashing |
 | UI | Tailwind CSS v4 + minimal in-repo primitives (Button, Input, Dialog, Badge) |
 | Validation | Zod on both API routes and forms |
 | Testing | Vitest (unit + integration) |
-| Deployment | Railway with persistent volume |
+| Deployment | Vercel + Neon Postgres |
 
 ---
 
@@ -38,18 +38,21 @@ npm --version    # 10.x or 11.x
 
 ## Setup
 
+You need a Postgres database. The easiest for local dev is to use the same Neon project the app deploys to — Neon has a free tier and works fine from a laptop over TLS. Alternatively, run `docker run --name pg -e POSTGRES_PASSWORD=pw -p 5432:5432 -d postgres` and use that URL.
+
 ```bash
 # 1. Clone and install
-git clone <your-fork-url>
-cd crossval
+git clone https://github.com/Riajain/orders-and-settlements.git
+cd orders-and-settlements
 npm install
 
 # 2. Set up env
 cp .env.example .env
-# .env defaults to SQLite at ./prisma/dev.db and AUTH_URL=http://localhost:3000
+# Edit .env — set DATABASE_URL (pooled) and DATABASE_URL_UNPOOLED (direct) to
+# any Postgres. AUTH_SECRET can be `openssl rand -base64 32`.
 
-# 3. Create DB + apply migrations + seed
-npm run db:migrate       # creates prisma/dev.db and applies migrations
+# 3. Apply migrations + seed
+npm run db:migrate       # applies prisma/migrations/*
 npm run db:seed          # seeds demo@example.com / demo1234 with 4 orders
 
 # 4. Run dev server
@@ -228,72 +231,51 @@ Integration tests share a single SQLite file (`prisma/test.db`, rebuilt each run
 
 ## Deployment
 
-Chosen host: **Railway** with a mounted volume for the SQLite file. Vercel serverless has an ephemeral filesystem and SQLite doesn't persist across invocations there.
+Deployed at **https://orders-and-settlements-psi.vercel.app** — Vercel serverless functions with a Neon Postgres backend attached via the Vercel Marketplace.
 
-### One-time setup
+### Reproducing the deploy
 
 ```bash
-# 1. Push your repo to GitHub
-git init && git add -A && git commit -m "Initial commit"
-git remote add origin git@github.com:you/orders-and-settlements.git
-git push -u origin main
+# 0. Install CLIs, sign in
+npm i -g vercel
+vercel login
 
-# 2. Install Railway CLI
-npm i -g @railway/cli
-railway login
+# 1. Link the local repo to a new Vercel project
+vercel link --yes --project orders-and-settlements
 
-# 3. Create project and link
-railway init         # follow prompts, pick "Empty Project"
-railway link         # link to the created project
+# 2. Attach Neon Postgres from the Marketplace and connect it to the project.
+#    Accepts terms in the browser on first install (one-time).
+vercel install neon --claim
 
-# 4. Add a Volume
-#    Railway dashboard → your service → Settings → Volumes:
-#      Mount path: /data
-#    (or via CLI: railway volume add --mount /data)
+# 3. Pull the Neon-provided env vars locally (DATABASE_URL, DATABASE_URL_UNPOOLED, ...)
+vercel env pull .env.local
+cp .env.local .env         # for local Prisma commands
 
-# 5. Set environment variables (via CLI or dashboard)
-railway variables --set "DATABASE_URL=file:/data/prod.db"
-railway variables --set "AUTH_SECRET=$(openssl rand -base64 32)"
-railway variables --set "NODE_ENV=production"
+# 4. Generate and apply the initial migration to the Neon DB
+npm run db:migrate         # writes prisma/migrations/*, applies to Neon
+npm run db:seed            # seeds demo@example.com / demo1234
+
+# 5. Add AUTH_SECRET (and AUTH_TRUST_HOST so Auth.js accepts Vercel's hostname)
+vercel env add AUTH_SECRET production          # paste `openssl rand -base64 32`
+vercel env add AUTH_TRUST_HOST production      # value: true
 
 # 6. Deploy
-railway up
+vercel deploy --prod --yes
 ```
 
-Railway will read `railway.json` and `nixpacks.toml` and use Node 20. On boot, `npx prisma migrate deploy` runs against the mounted volume, so the first deploy creates the DB schema in `/data/prod.db`.
+The build runs `prisma generate && prisma migrate deploy && next build`. On subsequent deploys, `migrate deploy` no-ops if there are no new migrations.
 
-### After the first deploy
+### Alternate deploy notes
 
-```bash
-# Get the public URL
-railway domain
-
-# Set AUTH_URL to that URL (Auth.js v5 needs it for callbacks)
-railway variables --set "AUTH_URL=https://<your-app>.up.railway.app"
-
-# Seed the demo user in prod
-railway run npm run db:seed
-```
-
-Then log in as `demo@example.com` / `demo1234`.
-
-### If Railway won't work
-
-Swap the DB to **Turso** (SQLite-compatible edge DB) and deploy to Vercel:
-
-```bash
-npm i @libsql/client @prisma/adapter-libsql
-# Update src/lib/prisma.ts to use the libsql adapter
-# Set DATABASE_URL to your Turso URL
-```
-
-Left as a documented alternative — I chose Railway for the take-home because it keeps Prisma + SQLite parity with the local dev experience.
+- **Node version**: Vercel defaults to Node 24. Local dev uses Node 20+.
+- **Deployment protection**: New Vercel projects default to SSO-protected preview URLs. For the take-home to be publicly reviewable, I ran `vercel project protection disable --sso orders-and-settlements`.
+- **Env-var scope**: All Neon vars are set to Production + Preview + Development so `vercel env pull` picks them up locally too.
 
 ---
 
 ## Assumptions and tradeoffs
 
-- **SQLite** is fine for this workload. The concurrency test proves the invariant holds under contention. For a real B2B/SaaS product with multi-region writes, swap to Postgres and use `SELECT ... FOR UPDATE`.
+- **Postgres via Neon** in prod, but the concurrency approach was originally designed for SQLite (retry-on-busy + serializable transaction + post-insert re-check). It works correctly on Postgres too, but the more idiomatic Postgres pattern would be `SELECT ... FOR UPDATE` on the order row inside the transaction. Documented as an upgrade path.
 - **`totalCents` is cached** on the order row. Denormalized for cheap list queries; recomputed inside the update transaction from line items. If we ever mutate line items via SQL outside the service layer, this could drift.
 - **Auth uses JWT sessions** (Auth.js stateless mode). No session table, no DB hit per request. Trade-off: revoking a session before its expiry is not possible without rotating `AUTH_SECRET`. For a real app I'd use rotating refresh tokens.
 - **Signup validation is minimal** — email format + password ≥ 8 chars. No email verification, no rate limit, no password strength meter. Fine for the assignment; not for prod.
@@ -306,7 +288,7 @@ Left as a documented alternative — I chose Railway for the take-home because i
 
 ## What I would improve before production
 
-1. **Postgres** with `SELECT ... FOR UPDATE` on the order row inside the payment transaction. SQLite is fine for this take-home but doesn't scale horizontally.
+1. **Row-level locking** on Postgres via `SELECT ... FOR UPDATE` on the order row inside the payment transaction — cleaner than the retry-on-busy pattern I ported over from the initial SQLite design.
 2. **Audit log** — currently no history of status transitions. An `OrderEvent` table appended inside every write transaction would enable "why did this go from paid → partially_paid" reconstructions.
 3. **Rate limiting** on `/api/auth/signup` and `/api/auth/callback/credentials` — trivial with Upstash Redis or a per-IP token bucket.
 4. **Email verification** on signup, password reset flow, session revocation.
@@ -355,5 +337,4 @@ tests/
   integration/            — Prisma-backed service tests
 
 middleware.ts             — Auth.js route protection
-railway.json, nixpacks.toml — deployment config
 ```
