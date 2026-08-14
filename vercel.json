@@ -3,7 +3,8 @@
     "web": {
       "root": ".",
       "framework": "nextjs",
-      "buildCommand": "npm ci && npm run build"
+      "installCommand": "npm ci --include=dev",
+      "buildCommand": "npm run build"
     }
   },
   "rewrites": [
